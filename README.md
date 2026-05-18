@@ -8,8 +8,9 @@ See [PLAN.md](PLAN.md) for the full design.
 
 ## Status
 
-P1 — Claude normalizer + Perfetto trace emitter. Codex parser/normalizer
-lands in P2.
+P5 — unified Claude+Codex Perfetto trace + categorized events + per-session
+stats + agent-side optimization hints. P4 (telemetry sampler) and P6
+(telemetry-driven GPU/build hints) are the remaining phases.
 
 ## Read-only access
 
@@ -25,14 +26,31 @@ pip install -e .
 # Sanity-check that we can read your local Claude/Codex logs
 agent-tracer discover
 
-# Stream raw events from a source
-agent-tracer list --source claude --limit 20
-agent-tracer list --source codex --limit 20
-
-# Build a Perfetto trace from the last few weeks of Claude sessions
+# Build a unified Perfetto trace (Claude + Codex) for the last few weeks
 agent-tracer build --since 2026-05-01 -o trace.json
 # Open trace.json in https://ui.perfetto.dev
+
+# Per-session tables: wall-clock, tools, tokens, cache hit rate, top commands
+agent-tracer stats --since 2026-05-01
+
+# Ranked optimization hints (markdown or --json)
+agent-tracer hints --since 2026-05-01
+
+# Restrict to one source / project / set of sessions
+agent-tracer hints --since 2026-05-01 --source codex
+agent-tracer build  --project-slug=-home-nod-github-claude-rocm-workspace -o trace.json
 ```
+
+## Detectors shipped (P5, agent-side only)
+
+- **redundant_reads** — same file Read ≥3× in one session.
+- **repeated_bash** — identical Bash/exec_command ≥3× in one session
+  (filters trivial pwd/ls/cd).
+- **compaction_frequency** — context-compaction firing ≥3× per session.
+- **hot_tool_time** — one tool kind dominating ≥50% of session wall-clock.
+
+Each hint carries concrete anchors (session id, timestamp, command snippet)
+and a remediation string. Min-evidence thresholds suppress noise.
 
 ## Data sources
 
