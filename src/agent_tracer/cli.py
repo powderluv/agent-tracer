@@ -1,7 +1,11 @@
 """Argparse-based entry point.
 
-P0 shipped ``discover`` and ``list``. P1 adds ``build`` (Claude → Perfetto
-trace JSON). Codex is folded into ``build`` in P2.
+Commands:
+* ``discover``  — schema sanity report
+* ``list``      — raw JSONL records (debug)
+* ``build``     — Perfetto trace JSON
+* ``stats``     — tables (per-session summary, tool histogram, top commands)
+* ``hints``     — ranked optimization hints (markdown)
 """
 
 from __future__ import annotations
@@ -10,14 +14,18 @@ import argparse
 import json
 import sys
 from collections.abc import Iterable
+from datetime import UTC
 from pathlib import Path
 
 from agent_tracer import __version__
-from agent_tracer.categorize import categorize_in_place
-from agent_tracer.normalize import normalize_claude_session, normalize_codex_session
+from agent_tracer.events import EventKind
+from agent_tracer.hints import Hint, run_all
 from agent_tracer.parsers import claude, codex, discover
 from agent_tracer.perfetto import TraceBuilder
-from agent_tracer.timeutil import iso_to_us
+from agent_tracer.pipeline import Filters, iter_events
+from agent_tracer.stats import StatsReport, compute_stats
+
+# --- subcommand: discover ---------------------------------------------------
 
 
 def _cmd_discover(args: argparse.Namespace) -> int:
@@ -25,6 +33,9 @@ def _cmd_discover(args: argparse.Namespace) -> int:
     codex_r = discover.scan_codex(file_limit=args.file_limit)
     print(discover.format_report(claude_r, codex_r))
     return 0
+
+
+# --- subcommand: list -------------------------------------------------------
 
 
 def _claude_records(limit: int | None) -> Iterable[dict]:
@@ -52,89 +63,38 @@ def _codex_records(limit: int | None) -> Iterable[dict]:
 
 
 def _cmd_list(args: argparse.Namespace) -> int:
-    if args.source == "claude":
-        records = _claude_records(args.limit)
-    elif args.source == "codex":
-        records = _codex_records(args.limit)
-    else:
-        return _err("--source must be 'claude' or 'codex'")
+    records = (
+        _claude_records(args.limit) if args.source == "claude" else _codex_records(args.limit)
+    )
     for rec in records:
         json.dump(rec, sys.stdout, default=str)
         sys.stdout.write("\n")
     return 0
 
 
-def _parse_since(s: str | None) -> int | None:
-    if not s:
-        return None
-    # Accept ``YYYY-MM-DD`` or full ISO; treat date-only as UTC midnight.
-    if len(s) == 10:
-        s = s + "T00:00:00Z"
-    return iso_to_us(s)
+# --- subcommand: build ------------------------------------------------------
+
+
+def _filters_from_args(args: argparse.Namespace) -> Filters:
+    return Filters.parse(
+        since=getattr(args, "since", None),
+        until=getattr(args, "until", None),
+        sources=getattr(args, "source", None),
+        sessions=getattr(args, "session", None),
+        project_slug=getattr(args, "project_slug", None),
+    )
 
 
 def _cmd_build(args: argparse.Namespace) -> int:
-    since_us = _parse_since(args.since)
-    until_us = _parse_since(args.until)
+    filters = _filters_from_args(args)
     builder = TraceBuilder()
-
-    sessions_filter = set(args.session) if args.session else None
-    sources = set(args.source) if args.source else {"claude", "codex"}
-    total_events = 0
-    files_used = 0
     sessions_used: set[tuple[str, str]] = set()
+    total_events = 0
 
-    def _in_window(ev_ts: int) -> bool:
-        if since_us is not None and ev_ts < since_us:
-            return False
-        return not (until_us is not None and ev_ts >= until_us)
-
-    if "claude" in sources:
-        for sf in claude.iter_session_files(project_slug=args.project_slug):
-            if sessions_filter is not None and sf.session_id not in sessions_filter:
-                continue
-            had_event = False
-            for ev in normalize_claude_session(
-                (rec for _, rec in claude.iter_raw_records(sf.path)),
-                source_session_id=sf.session_id,
-                source_agent_id=sf.agent_id,
-            ):
-                if not _in_window(ev.ts_start_us):
-                    continue
-                categorize_in_place(ev)
-                builder.add(ev)
-                total_events += 1
-                had_event = True
-            if had_event:
-                files_used += 1
-                sessions_used.add(("claude", sf.session_id))
-
-    if "codex" in sources:
-        for sf in codex.iter_session_files():
-            if sessions_filter is not None and sf.session_id not in sessions_filter:
-                continue
-            had_event = False
-            for ev in normalize_codex_session(
-                (rec for _, rec in codex.iter_raw_records(sf.path)),
-                source_session_id=sf.session_id,
-            ):
-                if not _in_window(ev.ts_start_us):
-                    continue
-                # If the user filtered by project slug, only keep Codex sessions
-                # whose cwd matches the slug.
-                if (
-                    args.project_slug
-                    and ev.cwd
-                    and claude.project_slug_for_cwd(ev.cwd) != args.project_slug
-                ):
-                    continue
-                categorize_in_place(ev)
-                builder.add(ev)
-                total_events += 1
-                had_event = True
-            if had_event:
-                files_used += 1
-                sessions_used.add(("codex", sf.session_id))
+    for ev in iter_events(filters):
+        builder.add(ev)
+        sessions_used.add((ev.source, ev.session_id))
+        total_events += 1
 
     trace = builder.finalize()
     out_path = Path(args.out)
@@ -142,16 +102,151 @@ def _cmd_build(args: argparse.Namespace) -> int:
     size = out_path.stat().st_size
     print(
         f"wrote {out_path}  "
-        f"events={total_events}  files={files_used}  sessions={len(sessions_used)}  "
+        f"events={total_events}  sessions={len(sessions_used)}  "
         f"size={size / (1 << 20):.2f}MiB",
         file=sys.stderr,
     )
     return 0
 
 
-def _err(msg: str) -> int:
-    print(f"agent-tracer: error: {msg}", file=sys.stderr)
-    return 2
+# --- subcommand: stats ------------------------------------------------------
+
+
+def _cmd_stats(args: argparse.Namespace) -> int:
+    filters = _filters_from_args(args)
+    report = compute_stats(iter_events(filters))
+    _print_stats(report, top_n=args.top)
+    return 0
+
+
+def _print_stats(report: StatsReport, *, top_n: int) -> None:
+    print(f"== sessions ({report.total_sessions}) ==")
+    rows = sorted(report.sessions.values(), key=lambda s: s.ts_start_us)
+    print(
+        f"{'source':6s} {'session':10s} {'wall':>8s} "
+        f"{'tools':>6s} {'tok_in':>9s} {'tok_out':>8s} {'cache_hit':>10s}"
+    )
+    for s in rows:
+        cache_pct = "—"
+        if s.cache_hit_rate is not None:
+            cache_pct = f"{s.cache_hit_rate * 100:.0f}%"
+        print(
+            f"{s.source:6s} {s.session_id[:8]:10s} "
+            f"{s.wallclock_s:>7.0f}s {s.tool_calls:>6d} "
+            f"{s.tokens_input:>9d} {s.tokens_output:>8d} {cache_pct:>10s}"
+        )
+
+    print()
+    print(f"== categories ({sum(report.overall_by_category.values())} events) ==")
+    for cat, n in report.overall_by_category.most_common(top_n):
+        print(f"  {cat:12s} {n:>7d}")
+
+    print()
+    print(f"== top tools by count (top {top_n}) ==")
+    for name, n in report.overall_by_tool.most_common(top_n):
+        wall = report.overall_tool_wall_us.get(name, 0) / 1_000_000
+        print(f"  {name:24s} {n:>7d}   {wall:>8.1f}s wall")
+
+    print()
+    print(f"== top tools by wall-clock (top {top_n}) ==")
+    by_wall = sorted(report.overall_tool_wall_us.items(), key=lambda kv: -kv[1])[:top_n]
+    for name, us in by_wall:
+        print(f"  {name:24s} {us / 1_000_000:>8.1f}s")
+
+    print()
+    print(f"== top shell commands (top {top_n}) ==")
+    for sig, n in report.top_commands.most_common(top_n):
+        print(f"  {sig:30s} {n:>5d}")
+
+
+# --- subcommand: hints ------------------------------------------------------
+
+
+def _cmd_hints(args: argparse.Namespace) -> int:
+    filters = _filters_from_args(args)
+    hints = run_all(iter_events(filters))
+    if args.category:
+        hints = [h for h in hints if h.category in args.category]
+    if args.json:
+        json.dump([_hint_to_json(h) for h in hints], sys.stdout, indent=2)
+        sys.stdout.write("\n")
+    else:
+        _print_hints_markdown(hints)
+    return 0
+
+
+def _hint_to_json(h: Hint) -> dict:
+    return {
+        "detector": h.detector,
+        "category": h.category,
+        "title": h.title,
+        "severity": h.severity.value,
+        "occurrences": h.occurrences,
+        "est_wall_saved_s": h.est_wall_saved_s,
+        "est_tokens_saved": h.est_tokens_saved,
+        "remediation": h.remediation,
+        "anchors": [
+            {"source": a.source, "session_id": a.session_id, "ts_us": a.ts_us, "detail": a.detail}
+            for a in h.anchors
+        ],
+        "evidence": h.evidence,
+    }
+
+
+def _print_hints_markdown(hints: list[Hint]) -> None:
+    if not hints:
+        print("# Hints\n\nNo hints fired in the selected window.")
+        return
+    print(f"# Hints ({len(hints)} found)\n")
+    for h in hints:
+        tag = f"[{h.severity.value.upper()}]"
+        savings = ""
+        if h.est_wall_saved_s and h.est_wall_saved_s >= 1:
+            savings = f" — est. {h.est_wall_saved_s:.0f}s saveable"
+        elif h.est_tokens_saved:
+            savings = f" — est. {h.est_tokens_saved:,} tokens saveable"
+        print(f"## {tag} {h.title}{savings}")
+        print(f"_detector_: `{h.detector}`  _category_: `{h.category}`  _occurrences_: {h.occurrences}\n")
+        if h.remediation:
+            print(h.remediation + "\n")
+        for a in h.anchors[:8]:
+            ts_iso = _us_to_iso(a.ts_us)
+            print(f"- `{a.source}:{a.session_id[:8]}` @ {ts_iso} — {a.detail}")
+        if len(h.anchors) > 8:
+            print(f"- … +{len(h.anchors) - 8} more")
+        print()
+
+
+def _us_to_iso(us: int) -> str:
+    from datetime import datetime
+
+    return datetime.fromtimestamp(us / 1_000_000, tz=UTC).isoformat(timespec="seconds")
+
+
+# --- parser ----------------------------------------------------------------
+
+
+def _add_filter_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--since", default=None, help="Drop events before this UTC time (YYYY-MM-DD or ISO).")
+    p.add_argument("--until", default=None, help="Drop events at or after this UTC time.")
+    p.add_argument(
+        "--session",
+        action="append",
+        default=None,
+        help="Restrict to these session ids (repeatable).",
+    )
+    p.add_argument(
+        "--project-slug",
+        default=None,
+        help="Restrict to one project slug (e.g., '-home-nod-github-...').",
+    )
+    p.add_argument(
+        "--source",
+        action="append",
+        choices=["claude", "codex"],
+        default=None,
+        help="Restrict to one or more sources (default: both).",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -160,12 +255,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     d = sub.add_parser("discover", help="Schema-discovery sanity report")
-    d.add_argument(
-        "--file-limit",
-        type=int,
-        default=None,
-        help="Limit files scanned per source (faster sanity check).",
-    )
+    d.add_argument("--file-limit", type=int, default=None,
+                   help="Limit files scanned per source (faster sanity check).")
     d.set_defaults(func=_cmd_discover)
 
     li = sub.add_parser("list", help="Stream raw records from a source (debug)")
@@ -174,36 +265,25 @@ def build_parser() -> argparse.ArgumentParser:
     li.set_defaults(func=_cmd_list)
 
     b = sub.add_parser("build", help="Build a Perfetto trace JSON from sessions")
-    b.add_argument(
-        "--since",
-        default=None,
-        help="Drop events before this UTC time (YYYY-MM-DD or ISO).",
-    )
-    b.add_argument(
-        "--until",
-        default=None,
-        help="Drop events at or after this UTC time (YYYY-MM-DD or ISO).",
-    )
-    b.add_argument(
-        "--session",
-        action="append",
-        default=None,
-        help="Restrict to these session ids (repeatable).",
-    )
-    b.add_argument(
-        "--project-slug",
-        default=None,
-        help="Restrict to one project slug (e.g., '-home-nod-github-...').",
-    )
-    b.add_argument(
-        "--source",
-        action="append",
-        choices=["claude", "codex"],
-        default=None,
-        help="Restrict to one or more sources (default: both).",
-    )
+    _add_filter_args(b)
     b.add_argument("-o", "--out", default="trace.json", help="Output path.")
     b.set_defaults(func=_cmd_build)
+
+    s = sub.add_parser("stats", help="Print per-session and aggregate statistics")
+    _add_filter_args(s)
+    s.add_argument("--top", type=int, default=15, help="Top-N rows per table.")
+    s.set_defaults(func=_cmd_stats)
+
+    h = sub.add_parser("hints", help="Print ranked optimization hints (markdown)")
+    _add_filter_args(h)
+    h.add_argument(
+        "--category",
+        action="append",
+        default=None,
+        help="Restrict to hint categories (e.g. agent, gpu, build). Repeatable.",
+    )
+    h.add_argument("--json", action="store_true", help="Emit JSON instead of markdown.")
+    h.set_defaults(func=_cmd_hints)
 
     return p
 
@@ -216,3 +296,13 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# Re-export so existing imports (`from agent_tracer.cli import _err`) still work
+# in any test code that may have grabbed it. Not used internally.
+def _err(msg: str) -> int:
+    print(f"agent-tracer: error: {msg}", file=sys.stderr)
+    return 2
+
+
+__all__ = ["build_parser", "main", "EventKind"]
