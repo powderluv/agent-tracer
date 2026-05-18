@@ -8,9 +8,8 @@ See [PLAN.md](PLAN.md) for the full design.
 
 ## Status
 
-P5 — unified Claude+Codex Perfetto trace + categorized events + per-session
-stats + agent-side optimization hints. P4 (telemetry sampler) and P6
-(telemetry-driven GPU/build hints) are the remaining phases.
+P4 — telemetry sampler daemon shipped. P6 (telemetry-driven GPU/build
+hints) is the remaining phase.
 
 ## Read-only access
 
@@ -39,7 +38,31 @@ agent-tracer hints --since 2026-05-01
 # Restrict to one source / project / set of sessions
 agent-tracer hints --since 2026-05-01 --source codex
 agent-tracer build  --project-slug=-home-nod-github-claude-rocm-workspace -o trace.json
+
+# Telemetry sampler (1Hz to LanceDB; needs [store] extras)
+pip install -e '.[store]'
+agent-tracer sample --interval 1
+# Or one-shot to verify it works
+agent-tracer sample --once
 ```
+
+## Telemetry sampler
+
+`agent-tracer sample` polls `rocm-smi`, `nvidia-smi`, and `/proc` and writes
+`gpu_telemetry` + `system_telemetry` tables to
+`~/.cache/agent-tracer/telemetry.lance`. Missing/erroring tools are silently
+skipped; the daemon still records what's available.
+
+Binary search paths (env override > venv `bin/` > `/opt/rocm/bin` >
+`/opt/rocm-*/bin` > `$PATH`):
+
+```
+AGENT_TRACER_ROCM_SMI=/opt/rocm-6.4/bin/rocm-smi agent-tracer sample
+AGENT_TRACER_NVIDIA_SMI=/usr/bin/nvidia-smi      agent-tracer sample
+```
+
+Writes are batched (≥256 rows or 60s) to avoid fragmenting the Lance
+dataset. SIGINT/SIGTERM flushes cleanly.
 
 ## Detectors shipped (P5, agent-side only)
 

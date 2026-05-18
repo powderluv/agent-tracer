@@ -6,6 +6,7 @@ Commands:
 * ``build``     — Perfetto trace JSON
 * ``stats``     — tables (per-session summary, tool histogram, top commands)
 * ``hints``     — ranked optimization hints (markdown)
+* ``sample``    — telemetry sampler daemon (rocm-smi/nvidia-smi/proc → LanceDB)
 """
 
 from __future__ import annotations
@@ -223,6 +224,29 @@ def _us_to_iso(us: int) -> str:
     return datetime.fromtimestamp(us / 1_000_000, tz=UTC).isoformat(timespec="seconds")
 
 
+# --- subcommand: sample -----------------------------------------------------
+
+
+def _cmd_sample(args: argparse.Namespace) -> int:
+    try:
+        from agent_tracer.telemetry.daemon import DEFAULT_DATASET, run
+    except ImportError as e:
+        if "lancedb" in str(e) or "pyarrow" in str(e):
+            return _err(
+                "sample requires the [store] extras. "
+                "Install with: pip install -e '.[store]'"
+            )
+        raise
+    dataset = Path(args.dataset) if args.dataset else DEFAULT_DATASET
+    run(
+        interval_s=args.interval,
+        dataset=dataset,
+        once=args.once,
+        quiet=args.quiet,
+    )
+    return 0
+
+
 # --- parser ----------------------------------------------------------------
 
 
@@ -284,6 +308,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     h.add_argument("--json", action="store_true", help="Emit JSON instead of markdown.")
     h.set_defaults(func=_cmd_hints)
+
+    sa = sub.add_parser(
+        "sample",
+        help="Run the telemetry sampler daemon (rocm-smi/nvidia-smi/proc → LanceDB)",
+    )
+    sa.add_argument("--interval", type=float, default=1.0, help="Seconds between ticks.")
+    sa.add_argument(
+        "--dataset",
+        default=None,
+        help="LanceDB dataset path (default: ~/.cache/agent-tracer/telemetry.lance).",
+    )
+    sa.add_argument("--once", action="store_true", help="Run a single tick and exit.")
+    sa.add_argument("--quiet", action="store_true", help="Suppress periodic status lines.")
+    sa.set_defaults(func=_cmd_sample)
 
     return p
 
