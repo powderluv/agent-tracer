@@ -58,6 +58,12 @@ def _compute_extras(events: list[AgentEvent]) -> dict[str, object]:
     activity_by_day: dict[str, dict[str, int]] = collections.defaultdict(
         lambda: {"events": 0, "tool_calls": 0, "sessions": set()}  # type: ignore[dict-item]
     )
+    # Tool-call-only breakdown — share + wall + avg/call per category, and the
+    # dominant category per tool name (>50% of that tool's invocations).
+    tool_cat_count: collections.Counter = collections.Counter()
+    tool_cat_wall_us: collections.Counter = collections.Counter()
+    tool_to_cat: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
+    total_tool_calls = 0
     user_prompts = 0
     user_rejections = 0
     thinking_blocks = 0
@@ -76,6 +82,11 @@ def _compute_extras(events: list[AgentEvent]) -> dict[str, object]:
         d["sessions"].add(f"{ev.source}:{ev.session_id}")  # type: ignore[union-attr]
         if ev.kind == EventKind.TOOL_CALL:
             d["tool_calls"] += 1
+            total_tool_calls += 1
+            cat = ev.category or "?"
+            tool_cat_count[cat] += 1
+            tool_cat_wall_us[cat] += ev.duration_us or 0
+            tool_to_cat[ev.name][cat] += 1
             if ev.cwd:
                 cwd_dist[ev.cwd] += 1
             if ev.subagent_type:
@@ -111,6 +122,17 @@ def _compute_extras(events: list[AgentEvent]) -> dict[str, object]:
     for ev in events:
         sessions_by_source[ev.source] += 0  # initialize keys
     # Rebuild sessions_by_source from stats so we don't double-count.
+
+    # Per-tool dominant category (only counted if it accounts for >50% of the
+    # tool's calls; otherwise reported as "mixed").
+    tool_dominant_cat: dict[str, str] = {}
+    for tool_name, counter in tool_to_cat.items():
+        if not counter:
+            continue
+        top_cat, top_n = counter.most_common(1)[0]
+        total = sum(counter.values())
+        tool_dominant_cat[tool_name] = top_cat if top_n / total > 0.5 else "mixed"
+
     return {
         "ts_min_us": ts_min,
         "ts_max_us": ts_max,
@@ -131,6 +153,10 @@ def _compute_extras(events: list[AgentEvent]) -> dict[str, object]:
         "thinking_blocks": thinking_blocks,
         "thinking_text_len_total": thinking_text_len_total,
         "error_events": error_events,
+        "tool_cat_count": tool_cat_count,
+        "tool_cat_wall_us": tool_cat_wall_us,
+        "tool_dominant_cat": tool_dominant_cat,
+        "total_tool_calls": total_tool_calls,
     }
 
 
@@ -224,19 +250,41 @@ def _format(
     p("\n")
 
     # --- Categories ---
-    p("## Event categories\n\n")
+    p("## Event categories (all events)\n\n")
+    p(
+        "_Includes tool calls plus text/thinking/model-counter events. "
+        "See the next section for a tool-only breakdown._\n\n"
+    )
     total_cat = sum(stats.overall_by_category.values()) or 1
     p("| Category | Count | Share |\n|---|---:|---:|\n")
     for cat, n in stats.overall_by_category.most_common():
         p(f"| {cat} | {_humanize_int(n)} | {n / total_cat * 100:.1f}% |\n")
     p("\n")
 
+    # --- Tool-only category breakdown ---
+    tool_cat_count = extras["tool_cat_count"]  # type: ignore[assignment]
+    tool_cat_wall_us = extras["tool_cat_wall_us"]  # type: ignore[assignment]
+    total_tool_calls = extras["total_tool_calls"] or 1  # type: ignore[union-attr]
+    p("## Tool calls by category\n\n")
+    p("| Category | Count | Share | Wall | Avg/call |\n|---|---:|---:|---:|---:|\n")
+    for cat, n in tool_cat_count.most_common():  # type: ignore[attr-defined]
+        wall_us = tool_cat_wall_us[cat]
+        wall_s = wall_us / 1_000_000
+        avg_ms = (wall_us / n / 1000) if n else 0
+        p(
+            f"| {cat} | {_humanize_int(n)} | {n / total_tool_calls * 100:.1f}% | "
+            f"{_humanize_seconds(wall_s)} | {avg_ms:.0f}ms |\n"
+        )
+    p("\n")
+
     # --- Top tools ---
+    tool_dominant_cat = extras["tool_dominant_cat"]  # type: ignore[assignment]
     p("## Top tools — by count\n\n")
-    p("| Tool | Count | Wall |\n|---|---:|---:|\n")
+    p("| Tool | Count | Wall | Dominant cat |\n|---|---:|---:|---|\n")
     for name, n in stats.overall_by_tool.most_common(20):
         wall = stats.overall_tool_wall_us.get(name, 0) / 1_000_000
-        p(f"| {name} | {_humanize_int(n)} | {_humanize_seconds(wall)} |\n")
+        cat = tool_dominant_cat.get(name, "—")  # type: ignore[attr-defined]
+        p(f"| {name} | {_humanize_int(n)} | {_humanize_seconds(wall)} | {cat} |\n")
     p("\n")
 
     p("## Top tools — by wall-clock\n\n")
