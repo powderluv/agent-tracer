@@ -336,4 +336,312 @@ def _from_assistant(
             )
 
 
-__all__ = ["normalize_claude_session"]
+# ──────────────────────────────────────────────────────────────────────────
+# Codex
+
+
+def normalize_codex_session(
+    records: Iterable[dict],
+    *,
+    source_session_id: str | None = None,
+) -> Iterator[AgentEvent]:
+    """Normalize one Codex rollout JSONL into events.
+
+    Codex is single-agent (no subagents). Tool span pairing:
+
+    * ``response_item.function_call`` ↔ ``response_item.function_call_output``
+      via ``call_id``. For shell calls, ``event_msg.exec_command_end`` arrives
+      between them with ``process_id``, ``parsed_cmd``, and aggregated stdout/
+      stderr — we stash that as side data on the span end.
+    * ``response_item.custom_tool_call`` ↔ ``response_item.custom_tool_call_output``
+      via ``call_id``. ``event_msg.patch_apply_end`` is the runtime-side
+      receipt for ``apply_patch`` and carries per-file diffs.
+
+    The session id passed in (or derived from the rollout filename) flows
+    onto every event because individual Codex records don't repeat it.
+    """
+    pending: dict[str, tuple[int, dict]] = {}  # call_id -> (start_ts_us, function_call_payload)
+    runtime_meta: dict[str, dict] = {}         # call_id -> exec_command_end / patch_apply_end payload
+    session_id = source_session_id or ""
+    cwd: str | None = None
+    model: str | None = None
+
+    for rec in records:
+        ts_raw = rec.get("timestamp")
+        if not isinstance(ts_raw, str):
+            continue
+        try:
+            ts_us = iso_to_us(ts_raw)
+        except ValueError:
+            continue
+        rtype = rec.get("type")
+        payload = rec.get("payload") or {}
+        if not isinstance(payload, dict):
+            continue
+        ptype = payload.get("type")
+
+        base = {
+            "source": "codex",
+            "session_id": session_id,
+            "agent_id": None,
+            "cwd": cwd,
+            "model": model,
+        }
+
+        if rtype == "session_meta":
+            session_id = session_id or payload.get("id") or ""
+            cwd = payload.get("cwd") or cwd
+            yield AgentEvent(
+                source="codex",
+                session_id=session_id,
+                kind=EventKind.SESSION_META,
+                name="session_meta",
+                ts_start_us=ts_us,
+                cwd=cwd,
+                payload={
+                    "originator": payload.get("originator"),
+                    "cli_version": payload.get("cli_version"),
+                    "model_provider": payload.get("model_provider"),
+                },
+            )
+            continue
+
+        if rtype == "response_item":
+            if ptype == "function_call":
+                cid = payload.get("call_id")
+                if cid:
+                    pending.setdefault(cid, (ts_us, payload))
+            elif ptype == "function_call_output":
+                yield from _emit_codex_tool_call(
+                    ptype, payload, ts_us, pending, runtime_meta, base
+                )
+            elif ptype == "custom_tool_call":
+                cid = payload.get("call_id")
+                if cid:
+                    pending.setdefault(cid, (ts_us, payload))
+            elif ptype == "custom_tool_call_output":
+                yield from _emit_codex_tool_call(
+                    ptype, payload, ts_us, pending, runtime_meta, base
+                )
+            elif ptype == "reasoning":
+                # Codex reasoning is usually encrypted; surface a length proxy.
+                content = payload.get("content")
+                summary = payload.get("summary") or []
+                enc = payload.get("encrypted_content") or ""
+                text_len = sum(
+                    len(c.get("text", "")) for c in (content or []) if isinstance(c, dict)
+                ) if isinstance(content, list) else 0
+                yield AgentEvent(
+                    kind=EventKind.THINKING,
+                    name="reasoning",
+                    ts_start_us=ts_us,
+                    payload={
+                        "text_len": text_len,
+                        "summary_len": len(summary),
+                        "encrypted_len": len(enc) if isinstance(enc, str) else 0,
+                    },
+                    **base,
+                )
+            elif ptype == "message":
+                # Assistant or user message in the model-facing log.
+                role = payload.get("role")
+                if role in ("assistant", "user", "developer"):
+                    parts = payload.get("content") or []
+                    text = "\n".join(
+                        c.get("text", "")
+                        for c in parts
+                        if isinstance(c, dict) and c.get("type") in ("input_text", "output_text", "text")
+                    )
+                    if text.strip():
+                        kind = EventKind.USER_TURN if role == "user" else EventKind.ASSISTANT_TEXT
+                        yield AgentEvent(
+                            kind=kind,
+                            name=f"{role}_message",
+                            ts_start_us=ts_us,
+                            payload={"text": _truncate_str(text, _MAX_TEXT_BYTES)},
+                            **base,
+                        )
+
+        elif rtype == "event_msg":
+            if ptype == "user_message":
+                msg = payload.get("message", "")
+                if msg:
+                    yield AgentEvent(
+                        kind=EventKind.USER_TURN,
+                        name="user_turn",
+                        ts_start_us=ts_us,
+                        payload={"text": _truncate_str(msg, _MAX_TEXT_BYTES)},
+                        **base,
+                    )
+            elif ptype == "agent_message":
+                msg = payload.get("message", "")
+                if msg:
+                    yield AgentEvent(
+                        kind=EventKind.ASSISTANT_TEXT,
+                        name="assistant_text",
+                        ts_start_us=ts_us,
+                        payload={
+                            "text": _truncate_str(msg, _MAX_TEXT_BYTES),
+                            "phase": payload.get("phase"),
+                        },
+                        **base,
+                    )
+            elif ptype == "token_count":
+                info = payload.get("info") or {}
+                last = info.get("last_token_usage") or {}
+                total = info.get("total_token_usage") or {}
+                if last:
+                    yield AgentEvent(
+                        kind=EventKind.ASSISTANT_MSG,
+                        name="token_count",
+                        ts_start_us=ts_us,
+                        tokens_input=last.get("input_tokens"),
+                        tokens_output=last.get("output_tokens"),
+                        cache_read=last.get("cached_input_tokens"),
+                        payload={
+                            "total_in": total.get("input_tokens"),
+                            "total_out": total.get("output_tokens"),
+                            "model_ctx": info.get("model_context_window"),
+                            "reasoning_out": last.get("reasoning_output_tokens"),
+                        },
+                        **base,
+                    )
+            elif ptype in ("exec_command_end", "patch_apply_end"):
+                cid = payload.get("call_id")
+                if cid:
+                    runtime_meta[cid] = payload
+            elif ptype == "task_started":
+                yield AgentEvent(
+                    kind=EventKind.PROGRESS,
+                    name="task_started",
+                    ts_start_us=ts_us,
+                    payload={"task_id": payload.get("task_id")},
+                    **base,
+                )
+            elif ptype == "task_complete":
+                yield AgentEvent(
+                    kind=EventKind.PROGRESS,
+                    name="task_complete",
+                    ts_start_us=ts_us,
+                    payload={"task_id": payload.get("task_id")},
+                    **base,
+                )
+            elif ptype == "context_compacted":
+                yield AgentEvent(
+                    kind=EventKind.COMPACTION,
+                    name="context_compacted",
+                    ts_start_us=ts_us,
+                    payload={},
+                    **base,
+                )
+            elif ptype == "turn_aborted":
+                yield AgentEvent(
+                    kind=EventKind.ERROR,
+                    name="turn_aborted",
+                    ts_start_us=ts_us,
+                    is_error=True,
+                    payload={"reason": _truncate_obj(payload.get("reason"), _MAX_INPUT_BYTES)},
+                    **base,
+                )
+            elif ptype == "error":
+                yield AgentEvent(
+                    kind=EventKind.ERROR,
+                    name="error",
+                    ts_start_us=ts_us,
+                    is_error=True,
+                    payload={"message": _truncate_obj(payload.get("message"), _MAX_INPUT_BYTES)},
+                    **base,
+                )
+        elif rtype == "compacted":
+            yield AgentEvent(
+                kind=EventKind.COMPACTION,
+                name="compacted",
+                ts_start_us=ts_us,
+                payload={},
+                **base,
+            )
+        # turn_context: cwd/model updates per turn — capture cwd and model for
+        # subsequent events.
+        if rtype == "turn_context":
+            new_cwd = payload.get("cwd")
+            new_model = payload.get("model")
+            if isinstance(new_cwd, str):
+                cwd = new_cwd
+            if isinstance(new_model, str):
+                model = new_model
+
+    # In-flight at end of stream → orphan.
+    for cid, (start_ts, call_payload) in pending.items():
+        yield AgentEvent(
+            source="codex",
+            session_id=session_id,
+            kind=EventKind.ERROR,
+            name=f"orphan:{call_payload.get('name', '?')}",
+            ts_start_us=start_ts,
+            tool_use_id=cid,
+            payload={"arguments": _truncate_obj(call_payload.get("arguments"), _MAX_INPUT_BYTES)},
+        )
+
+
+def _emit_codex_tool_call(
+    output_ptype: str,
+    output_payload: dict,
+    ts_us: int,
+    pending: dict[str, tuple[int, dict]],
+    runtime_meta: dict[str, dict],
+    base: dict[str, Any],
+) -> Iterator[AgentEvent]:
+    cid = output_payload.get("call_id")
+    if not cid:
+        return
+    pend = pending.pop(cid, None)
+    if pend is None:
+        yield AgentEvent(
+            kind=EventKind.ERROR,
+            name="orphan_tool_output",
+            ts_start_us=ts_us,
+            tool_use_id=cid,
+            is_error=True,
+            payload={
+                "output_kind": output_ptype,
+                "output": _truncate_obj(output_payload.get("output"), _MAX_RESULT_BYTES),
+            },
+            **base,
+        )
+        return
+    start_ts, call_payload = pend
+    tool_name = call_payload.get("name") or "?"
+    meta = runtime_meta.pop(cid, {}) or {}
+    is_error = False
+    exit_code: int | None = None
+    extras: dict[str, Any] = {}
+    if meta:
+        exit_code = meta.get("exit_code") if "exit_code" in meta else None
+        extras["process_id"] = meta.get("process_id")
+        extras["parsed_cmd"] = meta.get("parsed_cmd")
+        if meta.get("type") == "exec_command_end":
+            extras["aggregated_output"] = _truncate_obj(
+                meta.get("aggregated_output"), _MAX_RESULT_BYTES
+            )
+        elif meta.get("type") == "patch_apply_end":
+            extras["success"] = meta.get("success")
+            is_error = meta.get("success") is False
+            extras["changes"] = list((meta.get("changes") or {}).keys())
+    yield AgentEvent(
+        kind=EventKind.TOOL_CALL,
+        name=str(tool_name),
+        ts_start_us=start_ts,
+        ts_end_us=ts_us,
+        tool_use_id=cid,
+        is_error=is_error,
+        exit_code=exit_code,
+        payload={
+            "input": _truncate_obj(call_payload.get("arguments") or call_payload.get("input"), _MAX_INPUT_BYTES),
+            "output": _truncate_obj(output_payload.get("output"), _MAX_RESULT_BYTES),
+            **{k: v for k, v in extras.items() if v is not None},
+        },
+        **base,
+    )
+
+
+__all__ = ["normalize_claude_session", "normalize_codex_session"]

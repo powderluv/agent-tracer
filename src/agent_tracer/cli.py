@@ -13,7 +13,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from agent_tracer import __version__
-from agent_tracer.normalize import normalize_claude_session
+from agent_tracer.normalize import normalize_claude_session, normalize_codex_session
 from agent_tracer.parsers import claude, codex, discover
 from agent_tracer.perfetto import TraceBuilder
 from agent_tracer.timeutil import iso_to_us
@@ -78,29 +78,60 @@ def _cmd_build(args: argparse.Namespace) -> int:
     builder = TraceBuilder()
 
     sessions_filter = set(args.session) if args.session else None
+    sources = set(args.source) if args.source else {"claude", "codex"}
     total_events = 0
     files_used = 0
-    sessions_used: set[str] = set()
+    sessions_used: set[tuple[str, str]] = set()
 
-    for sf in claude.iter_session_files(project_slug=args.project_slug):
-        if sessions_filter is not None and sf.session_id not in sessions_filter:
-            continue
-        had_event = False
-        for ev in normalize_claude_session(
-            (rec for _, rec in claude.iter_raw_records(sf.path)),
-            source_session_id=sf.session_id,
-            source_agent_id=sf.agent_id,
-        ):
-            if since_us is not None and ev.ts_start_us < since_us:
+    def _in_window(ev_ts: int) -> bool:
+        if since_us is not None and ev_ts < since_us:
+            return False
+        return not (until_us is not None and ev_ts >= until_us)
+
+    if "claude" in sources:
+        for sf in claude.iter_session_files(project_slug=args.project_slug):
+            if sessions_filter is not None and sf.session_id not in sessions_filter:
                 continue
-            if until_us is not None and ev.ts_start_us >= until_us:
+            had_event = False
+            for ev in normalize_claude_session(
+                (rec for _, rec in claude.iter_raw_records(sf.path)),
+                source_session_id=sf.session_id,
+                source_agent_id=sf.agent_id,
+            ):
+                if not _in_window(ev.ts_start_us):
+                    continue
+                builder.add(ev)
+                total_events += 1
+                had_event = True
+            if had_event:
+                files_used += 1
+                sessions_used.add(("claude", sf.session_id))
+
+    if "codex" in sources:
+        for sf in codex.iter_session_files():
+            if sessions_filter is not None and sf.session_id not in sessions_filter:
                 continue
-            builder.add(ev)
-            total_events += 1
-            had_event = True
-        if had_event:
-            files_used += 1
-            sessions_used.add(sf.session_id)
+            had_event = False
+            for ev in normalize_codex_session(
+                (rec for _, rec in codex.iter_raw_records(sf.path)),
+                source_session_id=sf.session_id,
+            ):
+                if not _in_window(ev.ts_start_us):
+                    continue
+                # If the user filtered by project slug, only keep Codex sessions
+                # whose cwd matches the slug.
+                if (
+                    args.project_slug
+                    and ev.cwd
+                    and claude.project_slug_for_cwd(ev.cwd) != args.project_slug
+                ):
+                    continue
+                builder.add(ev)
+                total_events += 1
+                had_event = True
+            if had_event:
+                files_used += 1
+                sessions_used.add(("codex", sf.session_id))
 
     trace = builder.finalize()
     out_path = Path(args.out)
@@ -160,6 +191,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--project-slug",
         default=None,
         help="Restrict to one project slug (e.g., '-home-nod-github-...').",
+    )
+    b.add_argument(
+        "--source",
+        action="append",
+        choices=["claude", "codex"],
+        default=None,
+        help="Restrict to one or more sources (default: both).",
     )
     b.add_argument("-o", "--out", default="trace.json", help="Output path.")
     b.set_defaults(func=_cmd_build)
