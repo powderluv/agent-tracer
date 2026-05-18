@@ -13,6 +13,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from agent_tracer import __version__
+from agent_tracer.categorize import categorize_in_place
 from agent_tracer.normalize import normalize_claude_session, normalize_codex_session
 from agent_tracer.parsers import claude, codex, discover
 from agent_tracer.perfetto import TraceBuilder
@@ -100,6 +101,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
             ):
                 if not _in_window(ev.ts_start_us):
                     continue
+                categorize_in_place(ev)
                 builder.add(ev)
                 total_events += 1
                 had_event = True
@@ -126,6 +128,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
                     and claude.project_slug_for_cwd(ev.cwd) != args.project_slug
                 ):
                     continue
+                categorize_in_place(ev)
                 builder.add(ev)
                 total_events += 1
                 had_event = True

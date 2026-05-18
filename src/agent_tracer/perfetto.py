@@ -231,9 +231,37 @@ class TraceBuilder:
             args["tool_use_id"] = ev.tool_use_id
         if ev.subagent_type:
             args["subagent_type"] = ev.subagent_type
+        if ev.exit_code is not None:
+            args["exit_code"] = ev.exit_code
         if ev.payload:
-            args.update(ev.payload)
+            args.update(_flatten_args(ev.payload))
         return args
+
+
+_ARG_VALUE_CAP = 4096
+
+
+def _flatten_args(payload: dict[str, Any]) -> dict[str, Any]:
+    """JSON-serialize compound arg values so Perfetto displays them tidily.
+
+    Perfetto's args panel handles primitives and short strings best. Dicts
+    and lists get serialized + truncated; primitives pass through.
+    """
+    import json as _json
+
+    out: dict[str, Any] = {}
+    for k, v in payload.items():
+        if v is None or isinstance(v, (bool, int, float)):
+            out[k] = v
+        elif isinstance(v, str):
+            out[k] = v if len(v) <= _ARG_VALUE_CAP else v[:_ARG_VALUE_CAP] + "…"
+        else:
+            try:
+                s = _json.dumps(v, default=str)
+            except (TypeError, ValueError):
+                s = repr(v)
+            out[k] = s if len(s) <= _ARG_VALUE_CAP else s[:_ARG_VALUE_CAP] + "…"
+    return out
 
 
 def build_trace(events: Iterable[AgentEvent]) -> dict[str, Any]:

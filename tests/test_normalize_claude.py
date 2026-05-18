@@ -54,7 +54,8 @@ def test_tool_call_pairs_use_and_result_via_id() -> None:
     assert tool.tool_use_id == "tu1"
     assert tool.ts_end_us > tool.ts_start_us
     assert tool.duration_us is not None and tool.duration_us > 0
-    assert tool.payload["input"] and "ls" in tool.payload["input"]
+    # Input is preserved as a structured dict so the categorizer can read fields.
+    assert tool.payload["input"] == {"command": "ls"}
     assert "a\nb" in tool.payload["result"]
 
 

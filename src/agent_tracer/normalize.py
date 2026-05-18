@@ -46,19 +46,30 @@ def _truncate_str(s: str, n: int) -> str:
     return s[:n] + f"…<+{len(s) - n}B>"
 
 
-def _truncate_obj(obj: Any, n: int) -> Any:
-    """Stringify+truncate an opaque payload for args display."""
-    if obj is None:
-        return None
+def _parse_json_loosely(s: str) -> Any:
+    """Parse a JSON string; on failure return the original string."""
+    import json as _json
+
+    try:
+        return _json.loads(s)
+    except (ValueError, TypeError):
+        return s
+
+
+def _truncate_payload(obj: Any, n: int) -> Any:
+    """Keep structured shape; truncate string values only.
+
+    Strings longer than ``n`` get a tail marker. Lists/dicts are recursed.
+    Other primitives pass through. The categorizer needs the structured
+    shape; the Perfetto emitter does the final size cap when it serializes.
+    """
     if isinstance(obj, str):
         return _truncate_str(obj, n)
-    try:
-        import json
-
-        s = json.dumps(obj, default=str)
-    except (TypeError, ValueError):
-        s = repr(obj)
-    return _truncate_str(s, n)
+    if isinstance(obj, dict):
+        return {k: _truncate_payload(v, n) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_truncate_payload(v, n) for v in obj]
+    return obj
 
 
 def _extract_result_text(tool_result_block: dict) -> str:
@@ -133,7 +144,7 @@ def normalize_claude_session(
                 name=str(data.get("type", "progress")),
                 ts_start_us=ts_us,
                 payload={
-                    "data": _truncate_obj(data, _MAX_INPUT_BYTES),
+                    "data": _truncate_payload(data, _MAX_INPUT_BYTES),
                     "parent_tool_use_id": rec.get("parentToolUseID"),
                 },
                 **base,
@@ -157,7 +168,7 @@ def normalize_claude_session(
             uuid=parent_rec.get("uuid"),
             parent_uuid=parent_rec.get("parentUuid"),
             tool_use_id=tuid,
-            payload={"input": _truncate_obj(tu_block.get("input"), _MAX_INPUT_BYTES)},
+            payload={"input": _truncate_payload(tu_block.get("input"), _MAX_INPUT_BYTES)},
         )
 
 
@@ -173,7 +184,7 @@ def _from_user(
             kind=EventKind.ERROR,
             name="user_rejected",
             ts_start_us=ts_us,
-            payload={"reason": _truncate_obj(rec.get("toolUseResult"), _MAX_INPUT_BYTES)},
+            payload={"reason": _truncate_payload(rec.get("toolUseResult"), _MAX_INPUT_BYTES)},
             is_error=True,
             **base,
         )
@@ -246,7 +257,7 @@ def _from_user(
                 subagent_type=subagent_type,
                 is_error=bool(blk.get("is_error")),
                 payload={
-                    "input": _truncate_obj(input_obj, _MAX_INPUT_BYTES),
+                    "input": _truncate_payload(input_obj, _MAX_INPUT_BYTES),
                     "result": _truncate_str(
                         _extract_result_text(blk), _MAX_RESULT_BYTES
                     ),
@@ -540,7 +551,7 @@ def normalize_codex_session(
                     name="turn_aborted",
                     ts_start_us=ts_us,
                     is_error=True,
-                    payload={"reason": _truncate_obj(payload.get("reason"), _MAX_INPUT_BYTES)},
+                    payload={"reason": _truncate_payload(payload.get("reason"), _MAX_INPUT_BYTES)},
                     **base,
                 )
             elif ptype == "error":
@@ -549,7 +560,7 @@ def normalize_codex_session(
                     name="error",
                     ts_start_us=ts_us,
                     is_error=True,
-                    payload={"message": _truncate_obj(payload.get("message"), _MAX_INPUT_BYTES)},
+                    payload={"message": _truncate_payload(payload.get("message"), _MAX_INPUT_BYTES)},
                     **base,
                 )
         elif rtype == "compacted":
@@ -579,7 +590,7 @@ def normalize_codex_session(
             name=f"orphan:{call_payload.get('name', '?')}",
             ts_start_us=start_ts,
             tool_use_id=cid,
-            payload={"arguments": _truncate_obj(call_payload.get("arguments"), _MAX_INPUT_BYTES)},
+            payload={"arguments": _truncate_payload(call_payload.get("arguments"), _MAX_INPUT_BYTES)},
         )
 
 
@@ -604,7 +615,7 @@ def _emit_codex_tool_call(
             is_error=True,
             payload={
                 "output_kind": output_ptype,
-                "output": _truncate_obj(output_payload.get("output"), _MAX_RESULT_BYTES),
+                "output": _truncate_payload(output_payload.get("output"), _MAX_RESULT_BYTES),
             },
             **base,
         )
@@ -620,13 +631,18 @@ def _emit_codex_tool_call(
         extras["process_id"] = meta.get("process_id")
         extras["parsed_cmd"] = meta.get("parsed_cmd")
         if meta.get("type") == "exec_command_end":
-            extras["aggregated_output"] = _truncate_obj(
+            extras["aggregated_output"] = _truncate_payload(
                 meta.get("aggregated_output"), _MAX_RESULT_BYTES
             )
         elif meta.get("type") == "patch_apply_end":
             extras["success"] = meta.get("success")
             is_error = meta.get("success") is False
             extras["changes"] = list((meta.get("changes") or {}).keys())
+    # Codex serializes ``arguments`` as a JSON-encoded string; parse so the
+    # categorizer (and any downstream code) sees structured fields.
+    raw_input = call_payload.get("arguments") or call_payload.get("input")
+    if isinstance(raw_input, str):
+        raw_input = _parse_json_loosely(raw_input)
     yield AgentEvent(
         kind=EventKind.TOOL_CALL,
         name=str(tool_name),
@@ -636,8 +652,8 @@ def _emit_codex_tool_call(
         is_error=is_error,
         exit_code=exit_code,
         payload={
-            "input": _truncate_obj(call_payload.get("arguments") or call_payload.get("input"), _MAX_INPUT_BYTES),
-            "output": _truncate_obj(output_payload.get("output"), _MAX_RESULT_BYTES),
+            "input": _truncate_payload(raw_input, _MAX_INPUT_BYTES),
+            "output": _truncate_payload(output_payload.get("output"), _MAX_RESULT_BYTES),
             **{k: v for k, v in extras.items() if v is not None},
         },
         **base,

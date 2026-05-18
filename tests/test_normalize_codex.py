@@ -36,7 +36,9 @@ def test_function_call_pairs_with_function_call_output_via_call_id() -> None:
     assert t.name == "exec_command"
     assert t.tool_use_id == "c1"
     assert t.ts_end_us > t.ts_start_us
-    assert t.payload["input"] and "ls" in t.payload["input"]
+    # Codex arguments are JSON-stringified in the raw log; the normalizer
+    # parses them so the categorizer sees a structured dict.
+    assert t.payload["input"] == {"cmd": "ls"}
     assert "a\nb" in t.payload["output"]
     assert t.session_id == "sess-abc"
 
