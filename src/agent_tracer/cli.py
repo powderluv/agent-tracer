@@ -19,12 +19,14 @@ from datetime import UTC
 from pathlib import Path
 
 from agent_tracer import __version__
-from agent_tracer.events import EventKind
+from agent_tracer.events import AgentEvent, EventKind
 from agent_tracer.hints import Hint, run_all
 from agent_tracer.parsers import claude, codex, discover
 from agent_tracer.perfetto import TraceBuilder
 from agent_tracer.pipeline import Filters, iter_events
 from agent_tracer.stats import StatsReport, compute_stats
+from agent_tracer.telemetry.reader import DEFAULT_DATASET as DEFAULT_TELEMETRY
+from agent_tracer.telemetry.reader import TelemetryReader
 
 # --- subcommand: discover ---------------------------------------------------
 
@@ -91,23 +93,62 @@ def _cmd_build(args: argparse.Namespace) -> int:
     builder = TraceBuilder()
     sessions_used: set[tuple[str, str]] = set()
     total_events = 0
+    events_for_hints: list[AgentEvent] = []
 
     for ev in iter_events(filters):
         builder.add(ev)
         sessions_used.add((ev.source, ev.session_id))
         total_events += 1
+        if args.annotate_hints:
+            events_for_hints.append(ev)
+
+    hints_emitted = 0
+    if args.annotate_hints:
+        reader = _telemetry_reader(args.telemetry_dataset)
+        hints = run_all(events_for_hints, telemetry=reader)
+        for h in hints:
+            for a in h.anchors:
+                builder.add(_hint_to_event(h, a))
+                hints_emitted += 1
 
     trace = builder.finalize()
     out_path = Path(args.out)
     out_path.write_text(json.dumps(trace, separators=(",", ":")))
     size = out_path.stat().st_size
+    annot = f"  hint_instants={hints_emitted}" if args.annotate_hints else ""
     print(
         f"wrote {out_path}  "
         f"events={total_events}  sessions={len(sessions_used)}  "
-        f"size={size / (1 << 20):.2f}MiB",
+        f"size={size / (1 << 20):.2f}MiB{annot}",
         file=sys.stderr,
     )
     return 0
+
+
+def _hint_to_event(h: Hint, a) -> AgentEvent:
+    """Render a hint anchor as an instant ``AgentEvent`` for the trace."""
+    return AgentEvent(
+        source=a.source,  # type: ignore[arg-type]
+        session_id=a.session_id,
+        kind=EventKind.PROGRESS,  # rendered as a thread-scoped instant
+        name=f"hint:{h.detector}",
+        ts_start_us=a.ts_us,
+        category="opt-hint",
+        payload={
+            "severity": h.severity.value,
+            "title": h.title,
+            "detail": a.detail,
+            "remediation": h.remediation,
+        },
+    )
+
+
+def _telemetry_reader(dataset_arg: str | None) -> TelemetryReader | None:
+    dataset = Path(dataset_arg) if dataset_arg else DEFAULT_TELEMETRY
+    reader = TelemetryReader(dataset=dataset)
+    if reader.exists():
+        return reader
+    return None
 
 
 # --- subcommand: stats ------------------------------------------------------
@@ -165,7 +206,15 @@ def _print_stats(report: StatsReport, *, top_n: int) -> None:
 
 def _cmd_hints(args: argparse.Namespace) -> int:
     filters = _filters_from_args(args)
-    hints = run_all(iter_events(filters))
+    reader = _telemetry_reader(args.telemetry_dataset)
+    if reader is None and not args.no_telemetry:
+        print(
+            "[hints] telemetry dataset not found — GPU/CPU correlation detectors will be skipped.\n"
+            "        Run `agent-tracer sample` to start collecting; "
+            "or pass --no-telemetry to suppress this notice.",
+            file=sys.stderr,
+        )
+    hints = run_all(iter_events(filters), telemetry=reader)
     if args.category:
         hints = [h for h in hints if h.category in args.category]
     if args.json:
@@ -291,6 +340,16 @@ def build_parser() -> argparse.ArgumentParser:
     b = sub.add_parser("build", help="Build a Perfetto trace JSON from sessions")
     _add_filter_args(b)
     b.add_argument("-o", "--out", default="trace.json", help="Output path.")
+    b.add_argument(
+        "--annotate-hints",
+        action="store_true",
+        help="Run detectors and embed each hint anchor as an instant in the trace.",
+    )
+    b.add_argument(
+        "--telemetry-dataset",
+        default=None,
+        help="LanceDB telemetry dataset path (default: ~/.cache/agent-tracer/telemetry.lance).",
+    )
     b.set_defaults(func=_cmd_build)
 
     s = sub.add_parser("stats", help="Print per-session and aggregate statistics")
@@ -307,6 +366,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Restrict to hint categories (e.g. agent, gpu, build). Repeatable.",
     )
     h.add_argument("--json", action="store_true", help="Emit JSON instead of markdown.")
+    h.add_argument(
+        "--telemetry-dataset",
+        default=None,
+        help="LanceDB telemetry dataset path (default: ~/.cache/agent-tracer/telemetry.lance).",
+    )
+    h.add_argument(
+        "--no-telemetry",
+        action="store_true",
+        help="Skip telemetry-correlated detectors (and don't warn about missing telemetry).",
+    )
     h.set_defaults(func=_cmd_hints)
 
     sa = sub.add_parser(
