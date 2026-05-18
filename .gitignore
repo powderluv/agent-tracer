@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+
+# Tool output
+*.lance/
+*.parquet
+trace*.json
+hints*.md
+.coverage
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local cache (also lives in ~/.cache/agent-tracer normally)
+.cache/
