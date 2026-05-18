@@ -31,6 +31,7 @@ from collections.abc import Iterable, Iterator
 from typing import Any
 
 from agent_tracer.events import AgentEvent, EventKind
+from agent_tracer.redact import redact_secrets
 from agent_tracer.timeutil import iso_to_us
 
 # Truncation limits keep the trace JSON manageable. Perfetto and Chrome
@@ -41,6 +42,12 @@ _MAX_TEXT_BYTES = 2048
 
 
 def _truncate_str(s: str, n: int) -> str:
+    """Strip credentials, then truncate to ``n`` bytes with a tail marker.
+
+    Redaction happens *before* truncation so a secret that would otherwise
+    sit just past the truncation boundary still gets caught.
+    """
+    s = redact_secrets(s)
     if len(s) <= n:
         return s
     return s[:n] + f"…<+{len(s) - n}B>"
