@@ -3,9 +3,10 @@
 Commands:
 * ``discover``  — schema sanity report
 * ``list``      — raw JSONL records (debug)
-* ``build``     — Perfetto trace JSON
+* ``build``     — Perfetto trace JSON (``--annotate-hints`` to embed hints)
 * ``stats``     — tables (per-session summary, tool histogram, top commands)
 * ``hints``     — ranked optimization hints (markdown)
+* ``report``    — full markdown report (stats + hints + extras)
 * ``sample``    — telemetry sampler daemon (rocm-smi/nvidia-smi/proc → LanceDB)
 """
 
@@ -24,6 +25,7 @@ from agent_tracer.hints import Hint, run_all
 from agent_tracer.parsers import claude, codex, discover
 from agent_tracer.perfetto import TraceBuilder
 from agent_tracer.pipeline import Filters, iter_events
+from agent_tracer.report import generate_report
 from agent_tracer.stats import StatsReport, compute_stats
 from agent_tracer.telemetry.reader import DEFAULT_DATASET as DEFAULT_TELEMETRY
 from agent_tracer.telemetry.reader import TelemetryReader
@@ -273,6 +275,20 @@ def _us_to_iso(us: int) -> str:
     return datetime.fromtimestamp(us / 1_000_000, tz=UTC).isoformat(timespec="seconds")
 
 
+# --- subcommand: report -----------------------------------------------------
+
+
+def _cmd_report(args: argparse.Namespace) -> int:
+    filters = _filters_from_args(args)
+    markdown = generate_report(iter_events(filters), title=args.title)
+    if args.out:
+        Path(args.out).write_text(markdown)
+        print(f"wrote {args.out}  ({len(markdown):,} bytes)", file=sys.stderr)
+    else:
+        sys.stdout.write(markdown)
+    return 0
+
+
 # --- subcommand: sample -----------------------------------------------------
 
 
@@ -377,6 +393,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip telemetry-correlated detectors (and don't warn about missing telemetry).",
     )
     h.set_defaults(func=_cmd_hints)
+
+    r = sub.add_parser("report", help="One-shot markdown report (stats + hints + extras)")
+    _add_filter_args(r)
+    r.add_argument(
+        "-o",
+        "--out",
+        default=None,
+        help="Output path (default: stdout).",
+    )
+    r.add_argument(
+        "--title",
+        default="agent-tracer report",
+        help="Report title (markdown H1).",
+    )
+    r.set_defaults(func=_cmd_report)
 
     sa = sub.add_parser(
         "sample",
