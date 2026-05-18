@@ -10,6 +10,7 @@ import collections
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from io import StringIO
+from pathlib import Path
 
 from agent_tracer.events import AgentEvent, EventKind
 from agent_tracer.hints import Hint, run_all
@@ -38,13 +39,80 @@ def _humanize_int(n: int) -> str:
     return f"{n:,}"
 
 
-def generate_report(events: Iterable[AgentEvent], *, title: str = "agent-tracer report") -> str:
-    """Materialize events once, compute everything, format markdown."""
+def generate_report(
+    events: Iterable[AgentEvent],
+    *,
+    title: str = "agent-tracer report",
+    charts_dir: Path | None = None,
+    charts_relpath: str | None = None,
+) -> str:
+    """Materialize events once, compute everything, format markdown.
+
+    If ``charts_dir`` is given, generate SVG charts there and embed them
+    in the markdown using paths prefixed with ``charts_relpath`` (the
+    directory containing the charts, relative to the markdown file). The
+    CLI sets both for the user; tests may pass them directly.
+    """
     materialized = list(events)
     stats = compute_stats(materialized)
     hints = run_all(materialized)  # no telemetry — gpu detectors silently skipped
     extras = _compute_extras(materialized)
-    return _format(stats, hints, extras, title=title)
+    chart_refs: dict[str, str] | None = None
+    if charts_dir is not None:
+        chart_refs = _emit_charts(stats, extras, charts_dir, charts_relpath or "")
+    return _format(stats, hints, extras, title=title, chart_refs=chart_refs)
+
+
+def _emit_charts(
+    stats: StatsReport,
+    extras: dict,
+    charts_dir: Path,
+    relpath_prefix: str,
+) -> dict[str, str]:
+    """Generate the SVG suite. Returns {chart_key: ref_path_for_markdown}.
+
+    ``relpath_prefix`` is prepended to each chart's filename so the
+    embedded ``![](…)`` reference resolves relative to the markdown
+    file, regardless of where the chart directory lives on disk.
+    """
+    charts_dir.mkdir(parents=True, exist_ok=True)
+    from agent_tracer import charts
+
+    def _ref(name: str) -> str:
+        return f"{relpath_prefix.rstrip('/')}/{name}" if relpath_prefix else name
+
+    refs: dict[str, str] = {}
+    activity = extras.get("activity_by_day") or {}
+    if activity:
+        path = charts_dir / "activity_by_day.svg"
+        charts.chart_activity_by_day(activity, path)
+        refs["activity_by_day"] = _ref(path.name)
+
+    if extras.get("tool_cat_count"):
+        path = charts_dir / "tool_calls_by_category.svg"
+        charts.chart_tool_calls_by_category(
+            extras["tool_cat_count"], extras["tool_cat_wall_us"], path
+        )
+        refs["tool_calls_by_category"] = _ref(path.name)
+
+    if stats.overall_by_tool:
+        path = charts_dir / "top_tools_by_count.svg"
+        charts.chart_top_tools(
+            stats.overall_by_tool, stats.overall_tool_wall_us, path, top_n=15
+        )
+        refs["top_tools_by_count"] = _ref(path.name)
+        path = charts_dir / "top_tools_by_wall.svg"
+        charts.chart_tools_by_wall(
+            stats.overall_tool_wall_us, stats.overall_by_tool, path, top_n=15
+        )
+        refs["top_tools_by_wall"] = _ref(path.name)
+
+    if stats.sessions:
+        path = charts_dir / "sessions_timeline.svg"
+        charts.chart_sessions_timeline(list(stats.sessions.values()), path)
+        refs["sessions_timeline"] = _ref(path.name)
+
+    return refs
 
 
 # --- extras (things stats.py doesn't already compute) ---------------------
@@ -181,7 +249,11 @@ def _format(
     extras: dict[str, object],
     *,
     title: str,
+    chart_refs: dict[str, str] | None = None,
 ) -> str:
+    refs = chart_refs or {}
+    def _embed(key: str, alt: str) -> str:
+        return f"![{alt}]({refs[key]})\n\n" if key in refs else ""
     out = StringIO()
     p = out.write
 
@@ -224,8 +296,11 @@ def _format(
       f"(of which {extras['user_rejections']} were user-denied tool calls)\n")
     p("\n")
 
+    p(_embed("sessions_timeline", "Session timeline"))
+
     # --- Activity by day ---
     p("## Activity by day\n\n")
+    p(_embed("activity_by_day", "Tool calls per day"))
     p("| Day | Sessions | Events | Tool calls |\n")
     p("|---|---:|---:|---:|\n")
     activity = extras["activity_by_day"]  # type: ignore[assignment]
@@ -266,6 +341,7 @@ def _format(
     tool_cat_wall_us = extras["tool_cat_wall_us"]  # type: ignore[assignment]
     total_tool_calls = extras["total_tool_calls"] or 1  # type: ignore[union-attr]
     p("## Tool calls by category\n\n")
+    p(_embed("tool_calls_by_category", "Tool calls by category"))
     p("| Category | Count | Share | Wall | Avg/call |\n|---|---:|---:|---:|---:|\n")
     for cat, n in tool_cat_count.most_common():  # type: ignore[attr-defined]
         wall_us = tool_cat_wall_us[cat]
@@ -280,6 +356,7 @@ def _format(
     # --- Top tools ---
     tool_dominant_cat = extras["tool_dominant_cat"]  # type: ignore[assignment]
     p("## Top tools — by count\n\n")
+    p(_embed("top_tools_by_count", "Top tools by count"))
     p("| Tool | Count | Wall | Dominant cat |\n|---|---:|---:|---|\n")
     for name, n in stats.overall_by_tool.most_common(20):
         wall = stats.overall_tool_wall_us.get(name, 0) / 1_000_000
@@ -288,6 +365,7 @@ def _format(
     p("\n")
 
     p("## Top tools — by wall-clock\n\n")
+    p(_embed("top_tools_by_wall", "Top tools by wall-clock"))
     p("| Tool | Wall | Count |\n|---|---:|---:|\n")
     by_wall = sorted(stats.overall_tool_wall_us.items(), key=lambda kv: -kv[1])
     for name, us in by_wall[:20]:

@@ -280,10 +280,47 @@ def _us_to_iso(us: int) -> str:
 
 def _cmd_report(args: argparse.Namespace) -> int:
     filters = _filters_from_args(args)
-    markdown = generate_report(iter_events(filters), title=args.title)
+    want_charts = args.charts or args.pdf is not None
+    want_pdf = args.pdf is not None
+    if want_charts and not args.out:
+        return _err("--charts and --pdf require -o/--out")
+
+    charts_dir: Path | None = None
+    charts_relpath: str | None = None
+    if want_charts:
+        out_path_resolved = Path(args.out).resolve()
+        charts_subdir = Path(args.out).stem + "-charts"
+        charts_dir = out_path_resolved.parent / charts_subdir
+        # Reference the charts relative to the markdown file so the same
+        # ![](…) works for markdown viewers and weasyprint alike.
+        charts_relpath = charts_subdir
+
+    markdown = generate_report(
+        iter_events(filters),
+        title=args.title,
+        charts_dir=charts_dir,
+        charts_relpath=charts_relpath,
+    )
+
     if args.out:
-        Path(args.out).write_text(markdown)
-        print(f"wrote {args.out}  ({len(markdown):,} bytes)", file=sys.stderr)
+        out_path = Path(args.out)
+        out_path.write_text(markdown)
+        msg = f"wrote {out_path}  ({len(markdown):,} bytes)"
+        if charts_dir is not None:
+            n_svgs = len(list(charts_dir.glob("*.svg")))
+            msg += f"  charts={n_svgs} → {charts_dir.name}/"
+        if want_pdf:
+            try:
+                from agent_tracer.pdf import render as render_pdf
+            except ImportError as e:
+                return _err(
+                    f"--pdf requires the [pdf] extras (markdown + weasyprint): {e}"
+                )
+            pdf_path = Path(args.pdf) if args.pdf else out_path.with_suffix(".pdf")
+            render_pdf(out_path, pdf_path)
+            pdf_size = pdf_path.stat().st_size
+            msg += f"  pdf={pdf_path.name} ({pdf_size / 1024:.0f} KB)"
+        print(msg, file=sys.stderr)
     else:
         sys.stdout.write(markdown)
     return 0
@@ -400,12 +437,24 @@ def build_parser() -> argparse.ArgumentParser:
         "-o",
         "--out",
         default=None,
-        help="Output path (default: stdout).",
+        help="Output markdown path (default: stdout). Required with --pdf or --charts.",
     )
     r.add_argument(
         "--title",
         default="agent-tracer report",
         help="Report title (markdown H1).",
+    )
+    r.add_argument(
+        "--charts",
+        action="store_true",
+        help="Generate SVG charts beside the markdown and embed image references.",
+    )
+    r.add_argument(
+        "--pdf",
+        default=None,
+        nargs="?",
+        const="",
+        help="Also render a PDF. With no value, uses <out>.pdf. Implies --charts.",
     )
     r.set_defaults(func=_cmd_report)
 

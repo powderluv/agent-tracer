@@ -46,6 +46,15 @@ pip install -e '.[store]'
 agent-tracer sample --interval 1
 # Or one-shot to verify it works
 agent-tracer sample --once
+
+# Full markdown report (stats + hints + extras)
+agent-tracer report -o report.md
+
+# Same report with embedded SVG charts and a rendered PDF
+# (needs [pdf] extras: matplotlib + weasyprint + markdown)
+pip install -e '.[pdf]'
+agent-tracer report -o report.md --charts --pdf
+# Writes report.md, report-charts/*.svg, and report.pdf
 ```
 
 ## Telemetry sampler
