@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import json
 from pathlib import Path
 
@@ -16,28 +17,45 @@ def _write_jsonl(path: Path, records: list[dict]) -> None:
             f.write(json.dumps(r) + "\n")
 
 
-def test_claude_iter_session_files(tmp_path: Path, monkeypatch) -> None:
-    # Two sessions, one with a normal subagent and one compaction subagent.
+def test_claude_iter_session_files(tmp_path: Path) -> None:
+    # Real layout: main session JSONL is a sibling to the session subdir,
+    # not inside it. ``memory/`` should be ignored.
     proj = tmp_path / "-home-user-foo"
-    s1 = proj / "session-aaa"
-    s2 = proj / "session-bbb"
-    _write_jsonl(s1 / "session-aaa.jsonl", [{"type": "user", "uuid": "u1"}])
+    proj.mkdir(parents=True)
+    _write_jsonl(proj / "session-aaa.jsonl", [{"type": "user", "uuid": "u1"}])
     _write_jsonl(
-        s1 / "subagents" / "agent-a1234abcd.jsonl",
+        proj / "session-aaa" / "subagents" / "agent-a1234abcd.jsonl",
         [{"type": "user", "uuid": "u2", "agentId": "a1234abcd"}],
     )
     _write_jsonl(
-        s2 / "subagents" / "agent-acompact-deadbeef.jsonl",
+        proj / "session-bbb" / "subagents" / "agent-acompact-deadbeef.jsonl",
         [{"type": "system", "uuid": "u3"}],
     )
+    # Sessions with only-main (no subagents/ dir) must still be picked up.
+    _write_jsonl(proj / "session-ccc.jsonl", [{"type": "user", "uuid": "u4"}])
+    # memory/ dir should be ignored even though it shares the layout shape.
+    (proj / "memory").mkdir()
+    (proj / "memory" / "junk.txt").write_text("ignore me")
 
     files = list(claude.iter_session_files(root=tmp_path))
-    kinds = {f.kind for f in files}
-    assert kinds == {"main", "subagent", "subagent_compaction"}
+    by_kind = collections.Counter(f.kind for f in files)
+    assert by_kind == {"main": 2, "subagent": 1, "subagent_compaction": 1}
+
     sub = next(f for f in files if f.kind == "subagent")
     assert sub.agent_id == "a1234abcd"
+    assert sub.session_id == "session-aaa"
     comp = next(f for f in files if f.kind == "subagent_compaction")
     assert comp.is_compaction
+    assert comp.session_id == "session-bbb"
+
+    # Ordering: each main appears next to its subagents (session-id sorted).
+    sequence = [(f.kind, f.session_id) for f in files]
+    assert sequence == [
+        ("main", "session-aaa"),
+        ("subagent", "session-aaa"),
+        ("subagent_compaction", "session-bbb"),
+        ("main", "session-ccc"),
+    ]
 
 
 def test_claude_iter_raw_records_resumes_from_offset(tmp_path: Path) -> None:
@@ -82,10 +100,11 @@ def test_codex_iter_session_files_orders_by_start_time(tmp_path: Path) -> None:
 
 
 def test_discover_handles_realistic_records(tmp_path: Path) -> None:
-    # Mirror the actual record shapes we saw in ~/.claude and ~/.codex.
-    claude_root = tmp_path / "claude" / "-home-x" / "sess1"
+    # Mirror the actual record shapes and layout we saw in ~/.claude and ~/.codex.
+    claude_proj = tmp_path / "claude" / "-home-x"
+    claude_proj.mkdir(parents=True)
     _write_jsonl(
-        claude_root / "sess1.jsonl",
+        claude_proj / "sess1.jsonl",
         [
             {
                 "type": "assistant",

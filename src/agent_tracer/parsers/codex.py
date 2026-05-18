@@ -22,6 +22,10 @@ Each line is ``{timestamp, type, payload}``. Top-level ``type`` is one of
 The live Codex TUI also maintains ``~/.codex/logs_2.sqlite`` (WAL); we do not
 touch it. The rollout JSONLs are append-only and safe to stream.
 
+**Read-only contract**: every file is opened with ``"rb"`` mode. This module
+must never write, truncate, rename, or chmod anything under
+``CODEX_SESSIONS_DIR``. A regression test enforces it.
+
 Like the Claude parser, this module is the raw iteration layer; normalization
 into ``AgentEvent`` happens in a downstream module.
 """
