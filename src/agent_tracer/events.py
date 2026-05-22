@@ -20,7 +20,7 @@ class EventKind(StrEnum):
     SESSION_META = "session_meta"
 
 
-Source = Literal["claude", "codex"]
+Source = Literal["claude", "codex", "cursor"]
 
 
 @dataclass(slots=True)

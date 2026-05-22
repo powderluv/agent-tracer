@@ -1,3 +1,3 @@
-from agent_tracer.parsers import claude, codex, discover
+from agent_tracer.parsers import claude, codex, cursor, discover
 
-__all__ = ["claude", "codex", "discover"]
+__all__ = ["claude", "codex", "cursor", "discover"]

@@ -667,4 +667,185 @@ def _emit_codex_tool_call(
     )
 
 
-__all__ = ["normalize_claude_session", "normalize_codex_session"]
+# ──────────────────────────────────────────────────────────────────────────
+# Cursor
+
+# Token estimation: ~4 characters per token is the standard heuristic across
+# Claude/GPT tokenizers.  Used by the blob-based estimator below.
+_CHARS_PER_TOKEN = 4
+
+
+def _emit_blob_token_events(
+    blobs: list,
+    session_id: str,
+    session_start_us: int,
+    bubbles: list | None,
+) -> Iterator[AgentEvent]:
+    """Emit ``ASSISTANT_MSG`` events with token estimates from the blob store.
+
+    The blob store (``agentKv:blob:`` in ``state.vscdb``) contains the actual
+    API messages including tool results, system prompts, and condensation
+    summaries.  Token counts are estimated as ``chars / 4``.
+
+    ``tokens_input`` is the *incremental* new input since the last assistant
+    response (matching Claude/Codex semantics).  ``tokens_output`` is what
+    the model generated in this response.
+
+    A ``[Previous conversation summary]`` blob resets the input accumulator
+    (condensation replaces all prior context with a summary).
+    """
+    new_input_since_last = 0
+    blob_idx = 0
+    bubble_iter = iter(bubbles) if bubbles else iter([])
+
+    def _next_assistant_ts() -> int:
+        for b in bubble_iter:
+            if b.bubble_type == 2 and b.created_at_us > 0:
+                return b.created_at_us
+        return session_start_us + blob_idx * 1_000_000
+
+    for blob in blobs:
+        blob_tokens = max(1, blob.content_chars // _CHARS_PER_TOKEN)
+
+        if blob.is_summary:
+            new_input_since_last = blob_tokens
+            blob_idx += 1
+            continue
+
+        if blob.role in ("system", "user", "tool"):
+            new_input_since_last += blob_tokens
+        elif blob.role == "assistant":
+            yield AgentEvent(
+                source="cursor",
+                session_id=session_id,
+                kind=EventKind.ASSISTANT_MSG,
+                name="assistant_msg",
+                ts_start_us=_next_assistant_ts(),
+                tokens_input=new_input_since_last,
+                tokens_output=blob_tokens,
+                payload={"estimated": True},
+            )
+            new_input_since_last = 0
+
+        blob_idx += 1
+
+
+def normalize_cursor_session(
+    records: Iterable[dict],
+    *,
+    source_session_id: str | None = None,
+    bubbles: list | None = None,
+    terminal_logs: list | None = None,
+    session_start_us: int = 0,
+    blobs: list | None = None,
+) -> Iterator[AgentEvent]:
+    """Normalize one Cursor transcript JSONL into events.
+
+    Produces ``USER_TURN``, ``ASSISTANT_TEXT``, ``TOOL_CALL``, ``THINKING``,
+    and (when blobs are available) ``ASSISTANT_MSG`` events.
+
+    Timestamps come from bubble metadata (``state.vscdb``) when available,
+    falling back to synthetic 1-second-spaced timestamps from
+    ``session_start_us``.
+
+    Shell/Bash tool calls are matched to terminal logs for real durations.
+    """
+    session_id = source_session_id or ""
+
+    # Emit blob-based token events first (before JSONL-derived events).
+    if blobs:
+        yield from _emit_blob_token_events(blobs, session_id, session_start_us, bubbles)
+
+    # Terminal-log lookup by command string for Bash/Shell duration matching.
+    terminal_by_cmd: dict[str, list] = {}
+    for te in terminal_logs or []:
+        terminal_by_cmd.setdefault(te.command, []).append(te)
+
+    # Bubble iterator for real timestamps.
+    bubble_iter = iter(bubbles) if bubbles else iter([])
+    next_bubble: Any = next(bubble_iter, None)
+
+    record_idx = 0
+
+    for rec in records:
+        role = rec.get("role")
+        content = (rec.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            record_idx += 1
+            continue
+
+        for blk in content:
+            if not isinstance(blk, dict):
+                continue
+            btype = blk.get("type")
+
+            # Consume a matching bubble for timestamp.
+            ts_us = session_start_us + record_idx * 1_000_000
+            bubble_thinking_ms: int | None = None
+            bubble_tool_call_id: str | None = None
+
+            if next_bubble is not None:
+                is_match = (
+                    (role == "user" and btype == "text" and next_bubble.bubble_type == 1)
+                    or (role == "assistant" and next_bubble.bubble_type == 2)
+                )
+                if is_match:
+                    if next_bubble.created_at_us > 0:
+                        ts_us = next_bubble.created_at_us
+                    bubble_thinking_ms = next_bubble.thinking_duration_ms
+                    bubble_tool_call_id = next_bubble.tool_call_id
+                    next_bubble = next(bubble_iter, None)
+
+            base: dict[str, Any] = {
+                "source": "cursor",
+                "session_id": session_id,
+                "agent_id": None,
+            }
+
+            if btype == "text":
+                text = blk.get("text", "")
+                if not text.strip():
+                    continue
+                kind = EventKind.USER_TURN if role == "user" else EventKind.ASSISTANT_TEXT
+                name = "user_turn" if role == "user" else "assistant_text"
+                yield AgentEvent(
+                    kind=kind, name=name, ts_start_us=ts_us,
+                    payload={"text": _truncate_str(text, _MAX_TEXT_BYTES)},
+                    **base,
+                )
+
+            elif btype == "tool_use" and role == "assistant":
+                tool_name = blk.get("name", "?")
+                raw_input = blk.get("input") or {}
+
+                if bubble_thinking_ms is not None:
+                    yield AgentEvent(
+                        kind=EventKind.THINKING, name="thinking",
+                        ts_start_us=ts_us,
+                        payload={"text_len": 0, "duration_ms": bubble_thinking_ms},
+                        **base,
+                    )
+
+                # Match Bash/Shell to terminal logs for real durations.
+                ts_end_us: int | None = None
+                exit_code: int | None = None
+                if tool_name in ("Bash", "Shell") and isinstance(raw_input, dict):
+                    candidates = terminal_by_cmd.get(raw_input.get("command", ""), [])
+                    if candidates:
+                        te = candidates.pop(0)
+                        ts_us = te.started_at_us
+                        ts_end_us = te.ended_at_us
+                        exit_code = te.exit_code
+
+                yield AgentEvent(
+                    kind=EventKind.TOOL_CALL, name=str(tool_name),
+                    ts_start_us=ts_us, ts_end_us=ts_end_us,
+                    tool_use_id=bubble_tool_call_id, exit_code=exit_code,
+                    payload={"input": _truncate_payload(raw_input, _MAX_INPUT_BYTES)},
+                    **base,
+                )
+
+        record_idx += 1
+
+
+__all__ = ["normalize_claude_session", "normalize_codex_session", "normalize_cursor_session"]

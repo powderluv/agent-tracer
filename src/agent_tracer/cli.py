@@ -22,7 +22,7 @@ from pathlib import Path
 from agent_tracer import __version__
 from agent_tracer.events import AgentEvent, EventKind
 from agent_tracer.hints import Hint, run_all
-from agent_tracer.parsers import claude, codex, discover
+from agent_tracer.parsers import claude, codex, cursor, discover
 from agent_tracer.perfetto import TraceBuilder
 from agent_tracer.pipeline import Filters, iter_events
 from agent_tracer.report import generate_report
@@ -36,7 +36,8 @@ from agent_tracer.telemetry.reader import TelemetryReader
 def _cmd_discover(args: argparse.Namespace) -> int:
     claude_r = discover.scan_claude(file_limit=args.file_limit)
     codex_r = discover.scan_codex(file_limit=args.file_limit)
-    print(discover.format_report(claude_r, codex_r))
+    cursor_r = discover.scan_cursor(file_limit=args.file_limit)
+    print(discover.format_report(claude_r, codex_r, cursor_r))
     return 0
 
 
@@ -67,10 +68,25 @@ def _codex_records(limit: int | None) -> Iterable[dict]:
                 return
 
 
+def _cursor_records(limit: int | None) -> Iterable[dict]:
+    n = 0
+    for sf in cursor.iter_session_files():
+        for _, rec in cursor.iter_raw_records(sf.path):
+            rec.setdefault("_source", "cursor")
+            rec.setdefault("_file", str(sf.path))
+            yield rec
+            n += 1
+            if limit is not None and n >= limit:
+                return
+
+
 def _cmd_list(args: argparse.Namespace) -> int:
-    records = (
-        _claude_records(args.limit) if args.source == "claude" else _codex_records(args.limit)
-    )
+    if args.source == "claude":
+        records = _claude_records(args.limit)
+    elif args.source == "codex":
+        records = _codex_records(args.limit)
+    else:
+        records = _cursor_records(args.limit)
     for rec in records:
         json.dump(rec, sys.stdout, default=str)
         sys.stdout.write("\n")
@@ -304,7 +320,7 @@ def _cmd_report(args: argparse.Namespace) -> int:
 
     if args.out:
         out_path = Path(args.out)
-        out_path.write_text(markdown)
+        out_path.write_text(markdown, encoding="utf-8")
         msg = f"wrote {out_path}  ({len(markdown):,} bytes)"
         if charts_dir is not None:
             n_svgs = len(list(charts_dir.glob("*.svg")))
@@ -369,7 +385,7 @@ def _add_filter_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--source",
         action="append",
-        choices=["claude", "codex"],
+        choices=["claude", "codex", "cursor"],
         default=None,
         help="Restrict to one or more sources (default: both).",
     )
@@ -386,7 +402,7 @@ def build_parser() -> argparse.ArgumentParser:
     d.set_defaults(func=_cmd_discover)
 
     li = sub.add_parser("list", help="Stream raw records from a source (debug)")
-    li.add_argument("--source", required=True, choices=["claude", "codex"])
+    li.add_argument("--source", required=True, choices=["claude", "codex", "cursor"])
     li.add_argument("--limit", type=int, default=20)
     li.set_defaults(func=_cmd_list)
 
