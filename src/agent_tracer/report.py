@@ -269,7 +269,7 @@ def _format(
     p(f"- **Time span**: {_iso(ts_min)} → {_iso(ts_max)}  ({_humanize_seconds(span_s)})\n")  # type: ignore[arg-type]
     p(
         f"- **Sessions**: {stats.total_sessions} "
-        f"({src_counts['claude']} Claude, {src_counts['codex']} Codex)\n"
+        f"({src_counts['claude']} Claude, {src_counts['codex']} Codex, {src_counts['cursor']} Cursor)\n"
     )
     total_tool_calls = sum(s.tool_calls for s in stats.sessions.values())
     total_tool_wall_us = sum(s.tool_wall_us for s in stats.sessions.values())

@@ -100,6 +100,44 @@ _CODEX_TOOL_CATEGORY: dict[str, str] = {
     # exec_command handled separately.
 }
 
+_CURSOR_TOOL_CATEGORY: dict[str, str] = {
+    # Claude-like names
+    "Read": "fs",
+    "Glob": "fs",
+    "Grep": "fs",
+    "Edit": "editor",
+    "Write": "editor",
+    "StrReplace": "editor",
+    "NotebookEdit": "editor",
+    "MultiEdit": "editor",
+    "Agent": "agent",
+    "Task": "agent",
+    "CreatePlan": "agent",
+    "AskQuestion": "agent",
+    "ProbeAccessibility": "agent",
+    "WebFetch": "network",
+    "WebSearch": "network",
+    # Cursor-specific names (observed in real data)
+    "ReadFile": "fs",
+    "ListDir": "fs",
+    "SearchFiles": "fs",
+    "GrepSearch": "fs",
+    "FileSearch": "fs",
+    "ApplyPatch": "editor",
+    "EditFile": "editor",
+    "CreateFile": "editor",
+    "DeleteFile": "editor",
+    "ReplaceInFile": "editor",
+    "InsertCodeBlock": "editor",
+    "TodoRead": "agent",
+    "TodoWrite": "agent",
+    "TodoUpdate": "agent",
+    "PlanRead": "agent",
+    "PlanUpdate": "agent",
+    "BrowserAction": "network",
+    # Shell/Bash handled separately via command classifier.
+}
+
 
 # --- public API ------------------------------------------------------------
 
@@ -170,6 +208,13 @@ def _categorize_tool(event: AgentEvent) -> str | None:
         if name == "write_stdin":
             # Sending input to a running exec — track as shell continuation.
             return "shell"
+    elif event.source == "cursor":
+        cat = _CURSOR_TOOL_CATEGORY.get(name)
+        if cat:
+            return cat
+        if name in ("Bash", "Shell"):
+            cmd = _extract_command_str(input_)
+            return _classify_command(cmd) if cmd else "shell"
     # Unknown tool — fall back to ``tool``.
     return "tool"
 

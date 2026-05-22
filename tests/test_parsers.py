@@ -6,8 +6,8 @@ import collections
 import json
 from pathlib import Path
 
-from agent_tracer.parsers import claude, codex
-from agent_tracer.parsers.discover import scan_claude, scan_codex
+from agent_tracer.parsers import claude, codex, cursor
+from agent_tracer.parsers.discover import scan_claude, scan_codex, scan_cursor
 
 
 def _write_jsonl(path: Path, records: list[dict]) -> None:
@@ -171,3 +171,116 @@ def test_discover_handles_realistic_records(tmp_path: Path) -> None:
     assert xr.files == 1 and xr.records == 3
     assert xr.payload_types[("response_item", "function_call")] == 1
     assert xr.payload_types[("event_msg", "exec_command_end")] == 1
+
+
+# --- Cursor parser tests ---
+
+
+def test_cursor_iter_session_files(tmp_path: Path) -> None:
+    proj = tmp_path / "c-develop-foo"
+    proj.mkdir()
+    transcripts = proj / "agent-transcripts"
+    tid = "aaaa-bbbb-cccc"
+    _write_jsonl(
+        transcripts / tid / f"{tid}.jsonl",
+        [{"role": "user", "message": {"content": [{"type": "text", "text": "hi"}]}}],
+    )
+    # Second session in same project.
+    tid2 = "dddd-eeee-ffff"
+    _write_jsonl(
+        transcripts / tid2 / f"{tid2}.jsonl",
+        [{"role": "assistant", "message": {"content": [{"type": "text", "text": "hello"}]}}],
+    )
+    files = list(cursor.iter_session_files(root=tmp_path))
+    assert len(files) == 2
+    assert files[0].project_slug == "c-develop-foo"
+    assert files[0].transcript_id == tid
+    assert files[1].transcript_id == tid2
+
+
+def test_cursor_skips_dirs_without_agent_transcripts(tmp_path: Path) -> None:
+    (tmp_path / "1234567890").mkdir()  # numeric slug, no agent-transcripts/
+    files = list(cursor.iter_session_files(root=tmp_path))
+    assert files == []
+
+
+def test_cursor_iter_raw_records_skips_bad_lines(tmp_path: Path) -> None:
+    p = tmp_path / "t.jsonl"
+    p.write_text('{"role":"user"}\nbroken\n{"role":"assistant"}\n')
+    out = [r for _, r in cursor.iter_raw_records(p)]
+    assert len(out) == 2
+
+
+def test_cursor_iter_raw_records_resumes_from_offset(tmp_path: Path) -> None:
+    p = tmp_path / "t.jsonl"
+    _write_jsonl(p, [{"i": 0}, {"i": 1}, {"i": 2}])
+    offsets = [off for off, _ in cursor.iter_raw_records(p)]
+    resumed = [r for _, r in cursor.iter_raw_records(p, start_offset=offsets[1])]
+    assert [r["i"] for r in resumed] == [2]
+
+
+def test_cursor_project_slug_for_cwd() -> None:
+    assert cursor.project_slug_for_cwd("C:\\develop\\foo") == "c-develop-foo"
+    assert cursor.project_slug_for_cwd("/home/user/bar") == "home-user-bar"
+
+
+def test_cursor_terminal_log_parsing(tmp_path: Path) -> None:
+    proj = tmp_path / "proj"
+    terminals = proj / "terminals"
+    terminals.mkdir(parents=True)
+    (terminals / "123.txt").write_text(
+        "---\n"
+        'pid: 42460\n'
+        'cwd: "c:\\\\develop"\n'
+        'command: "git status"\n'
+        'started_at: 2026-05-15T13:49:05.619Z\n'
+        'running_for_ms: 2000\n'
+        "---\n"
+        "on branch main\n"
+        "---\n"
+        "exit_code: 0\n"
+        "elapsed_ms: 2000\n"
+        "ended_at: 2026-05-15T13:49:07.619Z\n"
+        "---\n"
+    )
+    entries = cursor.load_terminal_logs(proj)
+    assert len(entries) == 1
+    assert entries[0].command == "git status"
+    assert entries[0].exit_code == 0
+    assert entries[0].elapsed_ms == 2000
+    assert entries[0].ended_at_us is not None
+    assert entries[0].ended_at_us > entries[0].started_at_us
+
+
+def test_discover_handles_cursor_records(tmp_path: Path) -> None:
+    proj = tmp_path / "c-test-proj"
+    tid = "tid-001"
+    _write_jsonl(
+        proj / "agent-transcripts" / tid / f"{tid}.jsonl",
+        [
+            {"role": "user", "message": {"content": [{"type": "text", "text": "q"}]}},
+            {
+                "role": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "a"},
+                        {"type": "tool_use", "name": "Read", "input": {}},
+                    ],
+                },
+            },
+        ],
+    )
+    from agent_tracer.parsers import cursor as cursor_mod
+
+    orig = cursor_mod.CURSOR_PROJECTS_DIR
+    try:
+        cursor_mod.CURSOR_PROJECTS_DIR = tmp_path
+        cr = scan_cursor()
+    finally:
+        cursor_mod.CURSOR_PROJECTS_DIR = orig
+
+    assert cr.files == 1
+    assert cr.records == 2
+    assert cr.roles["user"] == 1
+    assert cr.roles["assistant"] == 1
+    assert cr.block_types[("assistant", "tool_use")] == 1

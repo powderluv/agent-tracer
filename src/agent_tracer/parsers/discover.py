@@ -15,7 +15,7 @@ from __future__ import annotations
 import collections
 from dataclasses import dataclass, field
 
-from agent_tracer.parsers import claude, codex
+from agent_tracer.parsers import claude, codex, cursor
 
 
 @dataclass(slots=True)
@@ -65,6 +65,15 @@ def scan_claude(file_limit: int | None = None) -> ClaudeReport:
     return report
 
 
+@dataclass(slots=True)
+class CursorReport:
+    files: int = 0
+    records: int = 0
+    projects_with_transcripts: int = 0
+    roles: collections.Counter = field(default_factory=collections.Counter)
+    block_types: collections.Counter = field(default_factory=collections.Counter)
+
+
 def scan_codex(file_limit: int | None = None) -> CodexReport:
     report = CodexReport()
     for i, sf in enumerate(codex.iter_session_files()):
@@ -81,7 +90,30 @@ def scan_codex(file_limit: int | None = None) -> CodexReport:
     return report
 
 
-def format_report(claude_r: ClaudeReport, codex_r: CodexReport) -> str:
+def scan_cursor(file_limit: int | None = None) -> CursorReport:
+    report = CursorReport()
+    seen_slugs: set[str] = set()
+    for i, sf in enumerate(cursor.iter_session_files()):
+        if file_limit is not None and i >= file_limit:
+            break
+        report.files += 1
+        seen_slugs.add(sf.project_slug)
+        for _, rec in cursor.iter_raw_records(sf.path):
+            report.records += 1
+            report.roles[rec.get("role", "?")] += 1
+            msg = rec.get("message")
+            if isinstance(msg, dict):
+                content = msg.get("content")
+                role = msg.get("role") or rec.get("role", "?")
+                if isinstance(content, list):
+                    for blk in content:
+                        if isinstance(blk, dict):
+                            report.block_types[(role, blk.get("type", "?"))] += 1
+    report.projects_with_transcripts = len(seen_slugs)
+    return report
+
+
+def format_report(claude_r: ClaudeReport, codex_r: CodexReport, cursor_r: CursorReport | None = None) -> str:
     lines: list[str] = []
     lines.append("== Claude ==")
     lines.append(
@@ -102,4 +134,16 @@ def format_report(claude_r: ClaudeReport, codex_r: CodexReport) -> str:
     lines.append("(record.type, payload.type) pairs:")
     for k, v in codex_r.payload_types.most_common(25):
         lines.append(f"  {k}: {v}")
+    if cursor_r is not None:
+        lines.append("")
+        lines.append("== Cursor ==")
+        lines.append(
+            f"files: {cursor_r.files} "
+            f"(across {cursor_r.projects_with_transcripts} projects)"
+        )
+        lines.append(f"records: {cursor_r.records}")
+        lines.append(f"roles: {dict(cursor_r.roles.most_common())}")
+        lines.append("role × content-block type:")
+        for k, v in cursor_r.block_types.most_common():
+            lines.append(f"  {k}: {v}")
     return "\n".join(lines)

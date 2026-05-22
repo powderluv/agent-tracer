@@ -79,10 +79,11 @@ def _snapshot_tree(root: Path) -> dict[Path, tuple[int, int, bytes]]:
 
 
 @pytest.fixture()
-def fake_logs(tmp_path: Path) -> tuple[Path, Path]:
-    """Build a tiny mirror of the Claude + Codex log layouts."""
+def fake_logs(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Build a tiny mirror of the Claude + Codex + Cursor log layouts."""
     claude_root = tmp_path / "claude"
     codex_root = tmp_path / "codex"
+    cursor_root = tmp_path / "cursor"
 
     proj = claude_root / "-home-x"
     # Main session file: <project>/<sessionId>.jsonl
@@ -101,42 +102,68 @@ def fake_logs(tmp_path: Path) -> tuple[Path, Path]:
     (codex_day / "rollout-2026-04-27T00-28-25-019dcdd6-aaaa-bbbb-cccc-ddddeeeeffff.jsonl").write_text(
         json.dumps({"timestamp": "t", "type": "session_meta", "payload": {}}) + "\n"
     )
-    return claude_root, codex_root
+
+    # Cursor transcript
+    cursor_proj = cursor_root / "c-test-proj"
+    tid = "tid-001"
+    transcript_dir = cursor_proj / "agent-transcripts" / tid
+    transcript_dir.mkdir(parents=True)
+    (transcript_dir / f"{tid}.jsonl").write_text(
+        json.dumps({"role": "user", "message": {"content": [{"type": "text", "text": "hi"}]}}) + "\n"
+    )
+    # Cursor terminal log
+    terminals_dir = cursor_proj / "terminals"
+    terminals_dir.mkdir(parents=True)
+    (terminals_dir / "100.txt").write_text(
+        "---\npid: 1\ncommand: \"ls\"\nstarted_at: 2026-01-01T00:00:00Z\n---\noutput\n---\nexit_code: 0\n---\n"
+    )
+
+    return claude_root, codex_root, cursor_root
 
 
-def test_parsers_do_not_mutate_log_tree(fake_logs: tuple[Path, Path]) -> None:
+def test_parsers_do_not_mutate_log_tree(fake_logs: tuple[Path, Path, Path]) -> None:
     """Runtime check: snapshot, run every parser entry point, snapshot again, diff."""
     from agent_tracer.parsers import claude as claude_mod
     from agent_tracer.parsers import codex as codex_mod
-    from agent_tracer.parsers.discover import scan_claude, scan_codex
+    from agent_tracer.parsers import cursor as cursor_mod
+    from agent_tracer.parsers.discover import scan_claude, scan_codex, scan_cursor
 
-    claude_root, codex_root = fake_logs
-    before = _snapshot_tree(claude_root) | _snapshot_tree(codex_root)
+    claude_root, codex_root, cursor_root = fake_logs
+    before = _snapshot_tree(claude_root) | _snapshot_tree(codex_root) | _snapshot_tree(cursor_root)
 
-    orig_c, orig_x = claude_mod.CLAUDE_PROJECTS_DIR, codex_mod.CODEX_SESSIONS_DIR
+    orig_c = claude_mod.CLAUDE_PROJECTS_DIR
+    orig_x = codex_mod.CODEX_SESSIONS_DIR
+    orig_cur = cursor_mod.CURSOR_PROJECTS_DIR
     try:
         claude_mod.CLAUDE_PROJECTS_DIR = claude_root
         codex_mod.CODEX_SESSIONS_DIR = codex_root
+        cursor_mod.CURSOR_PROJECTS_DIR = cursor_root
         # Exercise every read path we ship.
         for sf in claude_mod.iter_session_files():
             list(claude_mod.iter_raw_records(sf.path))
         for sf in codex_mod.iter_session_files():
             list(codex_mod.iter_raw_records(sf.path))
+        for sf in cursor_mod.iter_session_files():
+            list(cursor_mod.iter_raw_records(sf.path))
         scan_claude()
         scan_codex()
+        scan_cursor()
     finally:
         claude_mod.CLAUDE_PROJECTS_DIR = orig_c
         codex_mod.CODEX_SESSIONS_DIR = orig_x
+        cursor_mod.CURSOR_PROJECTS_DIR = orig_cur
 
-    after = _snapshot_tree(claude_root) | _snapshot_tree(codex_root)
+    after = _snapshot_tree(claude_root) | _snapshot_tree(codex_root) | _snapshot_tree(cursor_root)
     assert before == after, "Parser run modified the log tree"
 
 
 def test_default_log_dirs_are_read_only_in_repo_layout() -> None:
-    """The two module-level constants must point at the user's home, not the repo."""
+    """The module-level constants must point at the user's home, not the repo."""
     from agent_tracer.parsers.claude import CLAUDE_PROJECTS_DIR
     from agent_tracer.parsers.codex import CODEX_SESSIONS_DIR
+    from agent_tracer.parsers.cursor import CURSOR_PROJECTS_DIR
 
     home = Path(os.path.expanduser("~")).resolve()
     assert CLAUDE_PROJECTS_DIR.resolve().is_relative_to(home)
     assert CODEX_SESSIONS_DIR.resolve().is_relative_to(home)
+    assert CURSOR_PROJECTS_DIR.resolve().is_relative_to(home)
